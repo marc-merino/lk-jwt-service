@@ -6,6 +6,7 @@
 //! Environment-driven configuration parsing.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use rust_yaml::{Value, Yaml};
@@ -304,9 +305,59 @@ pub fn bind_addresses(lk_jwt_bind: &str) -> Vec<String> {
     }
 }
 
+pub fn parse_replica_url(lk_jwt_bind: &str, redis_url: &str) -> Result<Option<String>, String> {
+    let ip = env_var("LIVEKIT_JWT_REPLICA_IP");
+    if ip.is_empty() {
+        return Ok(None);
+    }
+    let ip: IpAddr = ip
+        .parse()
+        .map_err(|_| "LIVEKIT_JWT_REPLICA_IP must be an IP address".to_owned())?;
+    if redis_url.is_empty() {
+        return Err("LIVEKIT_JWT_REPLICA_IP requires LIVEKIT_REDIS_URL".into());
+    }
+    let port = lk_jwt_bind
+        .rsplit(':')
+        .next()
+        .and_then(|port| port.parse().ok())
+        .ok_or("LIVEKIT_JWT_BIND must include a port")?;
+    Ok(Some(format!("http://{}", SocketAddr::new(ip, port))))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_replica_url() {
+        for (ip, redis, want) in [
+            (None, "", Ok(None)),
+            (
+                Some("192.0.2.1"),
+                "redis://r",
+                Ok(Some("http://192.0.2.1:8080".into())),
+            ),
+            (
+                Some("2001:db8::1"),
+                "redis://r",
+                Ok(Some("http://[2001:db8::1]:8080".into())),
+            ),
+            (
+                Some("192.0.2.1"),
+                "",
+                Err("LIVEKIT_JWT_REPLICA_IP requires LIVEKIT_REDIS_URL".into()),
+            ),
+            (
+                Some("replica"),
+                "redis://r",
+                Err("LIVEKIT_JWT_REPLICA_IP must be an IP address".into()),
+            ),
+        ] {
+            temp_env::with_var("LIVEKIT_JWT_REPLICA_IP", ip, || {
+                assert_eq!(parse_replica_url(":8080", redis), want, "{ip:?}");
+            });
+        }
+    }
 
     #[test]
     fn test_read_key_secret() {

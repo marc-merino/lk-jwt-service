@@ -11,9 +11,10 @@ use std::sync::Arc;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-use lk_jwt_service::config::{bind_addresses, parse_config};
+use lk_jwt_service::config::{bind_addresses, parse_config, parse_replica_url};
 use lk_jwt_service::handler::Handler;
 use lk_jwt_service::helper::{LiveKitAuth, RealDeps};
+use lk_jwt_service::replica::{Replica, shutdown_signal};
 use lk_jwt_service::store::{Store, new_redis_store};
 
 #[tokio::main]
@@ -70,6 +71,35 @@ async fn main() {
         }
     };
 
+    let replica = match parse_replica_url(&config.lk_jwt_bind, &config.redis_url) {
+        Ok(None) => None,
+        Ok(Some(url)) => {
+            let replica = match Replica::new(&config.redis_url, &url).await {
+                Ok(replica) => replica,
+                Err(err) => {
+                    eprintln!("Could not start replica: {err}");
+                    std::process::exit(1);
+                }
+            };
+            let listener = bind(&config.lk_jwt_bind).await;
+            let router = replica.router();
+            let mut server = tokio::spawn(async move {
+                axum::serve(listener, router)
+                    .with_graceful_shutdown(shutdown_signal())
+                    .await
+            });
+            tokio::select! {
+                _ = replica.wait_for_leadership() => {}
+                _ = &mut server => return,
+            }
+            Some((replica, server))
+        }
+        Err(err) => {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
+    };
+
     let handler = Handler::new(
         LiveKitAuth {
             key: config.key.clone(),
@@ -100,23 +130,28 @@ async fn main() {
         "Starting service"
     );
 
-    let mut listener = None;
-    for bind_addr in bind_addresses(&config.lk_jwt_bind) {
-        match tokio::net::TcpListener::bind(&bind_addr).await {
-            Ok(bound) => {
-                listener = Some(bound);
-                break;
-            }
-            Err(err) => warn!(bind_addr, err = %err, "Failed to bind"),
+    let result = match replica {
+        Some((replica, server)) => {
+            replica.serve_locally(&handler);
+            let result = server.await.unwrap();
+            replica.release().await;
+            result
         }
-    }
-    let Some(listener) = listener else {
-        eprintln!("Failed to bind {}", config.lk_jwt_bind);
-        std::process::exit(1);
+        None => axum::serve(bind(&config.lk_jwt_bind).await, handler.prepare_router()).await,
     };
-    let router = handler.prepare_router();
-    if let Err(err) = axum::serve(listener, router).await {
+    if let Err(err) = result {
         eprintln!("{err}");
         std::process::exit(1);
     }
+}
+
+async fn bind(lk_jwt_bind: &str) -> tokio::net::TcpListener {
+    for bind_addr in bind_addresses(lk_jwt_bind) {
+        match tokio::net::TcpListener::bind(&bind_addr).await {
+            Ok(listener) => return listener,
+            Err(err) => warn!(bind_addr, err = %err, "Failed to bind"),
+        }
+    }
+    eprintln!("Failed to bind {lk_jwt_bind}");
+    std::process::exit(1);
 }

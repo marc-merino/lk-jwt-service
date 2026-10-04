@@ -264,8 +264,9 @@ pub(crate) mod test_support {
     // ── mini Redis server (miniredis replacement) ─────────────────────────────
 
     /// A minimal in-process Redis (RESP2) server supporting exactly the
-    /// commands this service uses: PING, HSET, HDEL, HGETALL. Used to keep
-    /// the Redis store tests hermetic.
+    /// commands this service uses: PING, HSET, HDEL, HGETALL, GET, SET NX and
+    /// the replica lease scripts. Expiry is not modelled. Used to keep the
+    /// Redis tests hermetic.
     pub(crate) struct MiniRedis {
         pub addr: std::net::SocketAddr,
         handle: tokio::task::JoinHandle<()>,
@@ -282,6 +283,7 @@ pub(crate) mod test_support {
         let addr = listener.local_addr().unwrap();
         let state: Arc<Mutex<HashMap<String, HashMap<String, String>>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let strings: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
 
         let handle = tokio::spawn(async move {
             loop {
@@ -289,8 +291,9 @@ pub(crate) mod test_support {
                     return;
                 };
                 let state = state.clone();
+                let strings = strings.clone();
                 tokio::spawn(async move {
-                    let _ = serve_connection(socket, state).await;
+                    let _ = serve_connection(socket, state, strings).await;
                 });
             }
         });
@@ -335,6 +338,7 @@ pub(crate) mod test_support {
     async fn serve_connection(
         socket: tokio::net::TcpStream,
         state: Arc<Mutex<HashMap<String, HashMap<String, String>>>>,
+        strings: Arc<Mutex<HashMap<String, String>>>,
     ) -> std::io::Result<()> {
         let (read_half, mut write_half) = socket.into_split();
         let mut reader = BufReader::new(read_half);
@@ -346,6 +350,30 @@ pub(crate) mod test_support {
             let command = parts[0].to_ascii_uppercase();
             let response = match command.as_str() {
                 "PING" => "+PONG\r\n".to_owned(),
+                "GET" if parts.len() == 2 => match strings.lock().unwrap().get(&parts[1]) {
+                    Some(value) => bulk_string(value),
+                    None => "$-1\r\n".to_owned(),
+                },
+                "SET" if parts.len() == 6 && parts[3] == "NX" => {
+                    let mut strings = strings.lock().unwrap();
+                    if strings.contains_key(&parts[1]) {
+                        "$-1\r\n".to_owned()
+                    } else {
+                        strings.insert(parts[1].clone(), parts[2].clone());
+                        "+OK\r\n".to_owned()
+                    }
+                }
+                "EVAL" if parts.len() >= 5 => {
+                    let mut strings = strings.lock().unwrap();
+                    if strings.get(&parts[3]) != Some(&parts[4]) {
+                        ":0\r\n".to_owned()
+                    } else {
+                        if parts[1].contains("'DEL'") {
+                            strings.remove(&parts[3]);
+                        }
+                        ":1\r\n".to_owned()
+                    }
+                }
                 "HSET" if parts.len() >= 4 && parts.len() % 2 == 0 => {
                     let mut state = state.lock().unwrap();
                     let hash = state.entry(parts[1].clone()).or_default();

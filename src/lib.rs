@@ -7,6 +7,7 @@ pub mod config;
 pub mod delayed_event_manager;
 pub mod handler;
 pub mod helper;
+pub mod replica;
 pub mod requests;
 pub mod retry;
 pub mod store;
